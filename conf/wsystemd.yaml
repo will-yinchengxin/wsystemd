@@ -1,0 +1,22 @@
+wsystemd:
+  mysql:
+    wsystemd:
+      host: 172.16.27.66
+      port: 3306
+      user: will
+      password: "admin@123"
+      dataBase: wsystemd
+      parseTime: true
+      maxIdleConns: 10
+      maxOpenConns: 30
+      connMaxLifetime: 28800
+      connMaxIdletime: 7200
+  scheduleTimeTicker: 30
+  # 是否为单机模式, 集群模式需要配置 etcd
+  singleMode: false
+  etcd: 127.0.0.1
+  #
+  #etcd:
+  #  - 127.0.0.1
+  #  - 127.0.0.1
+  workerId: "98005ba6-1c67-4ed2-bd04-25c64b0ee348"
