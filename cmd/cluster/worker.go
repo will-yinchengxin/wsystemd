@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 	"wsystemd/cmd/http/consts"
+	"wsystemd/cmd/http/dto/dao"
 	"wsystemd/cmd/log"
 	"wsystemd/cmd/utils"
 
@@ -31,6 +32,7 @@ type Worker struct {
 type ResourceInfo struct {
 	CPUUsage    float64
 	MemoryUsage float64
+	LoadUsage   float64
 	TaskCount   int
 }
 
@@ -52,9 +54,8 @@ type Task struct {
 
 func NewWorkerManager(endpoints []string, workerID string) (*WorkerManager, error) {
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:        endpoints,
-		DialTimeout:      5 * time.Second,
-		AutoSyncInterval: 5 * time.Second,
+		Endpoints:   endpoints,
+		DialTimeout: 5 * time.Second,
 	})
 	if err != nil {
 		return nil, err
@@ -70,6 +71,21 @@ func NewWorkerManager(endpoints []string, workerID string) (*WorkerManager, erro
 		return nil, err
 	}
 
+	cpuUsage, err := utils.GetCPUUsage()
+	if err != nil {
+		return nil, err
+	}
+
+	memUsage, err := utils.GetMemoryUsage()
+	if err != nil {
+		return nil, err
+	}
+
+	loadUsage, err := utils.GetLoadAverage()
+	if err != nil {
+		return nil, err
+	}
+
 	WkMg = &WorkerManager{
 		etcd: cli,
 		worker: Worker{
@@ -79,6 +95,12 @@ func NewWorkerManager(endpoints []string, workerID string) (*WorkerManager, erro
 			Port:     consts.ServerPort,
 			Status:   "active",
 			LastBeat: time.Now(),
+			Resources: ResourceInfo{
+				CPUUsage:    cpuUsage,
+				MemoryUsage: memUsage,
+				LoadUsage:   loadUsage,
+				TaskCount:   0,
+			},
 		},
 	}
 	return WkMg, nil
@@ -92,43 +114,48 @@ func (wm *WorkerManager) Register(ctx context.Context) error {
 	}
 
 	if len(resp.Kvs) > 0 {
-		var workerData map[string]interface{}
-		if err := json.Unmarshal(resp.Kvs[0].Value, &workerData); err != nil {
-			return err
-		}
-
-		wm.worker.IP = workerData["ip"].(string)
-		wm.worker.Hostname = workerData["hostname"].(string)
-		wm.worker.Port = workerData["port"].(string)
-		wm.worker.Status = workerData["status"].(string)
-		wm.worker.LastBeat = time.Now()
-
-		if count, ok := workerData["taskCount"].(float64); ok {
-			wm.taskCount = int64(count)
-		}
-
-		level.Info(log.Logger).Log("msg", "Worker already registered, syncing data", "id", wm.worker.ID)
-		return nil
+		wm.etcd.Delete(context.Background(), workerKey)
 	}
 
-	workerData, _ := json.Marshal(wm.worker)
-	_, err = wm.etcd.Put(context.Background(), workerKey, string(workerData))
+	if err := wm.updateResourceInfo(); err != nil {
+		level.Warn(log.Logger).Log("msg", "Failed to update initial resource info", "error", err)
+	}
+
+	workerData := map[string]interface{}{
+		"id":       wm.worker.ID,
+		"hostname": wm.worker.Hostname,
+		"ip":       wm.worker.IP,
+		"port":     wm.worker.Port,
+		"status":   wm.worker.Status,
+		"lastBeat": time.Now(),
+		"resources": map[string]interface{}{
+			"cpuUsage":    wm.worker.Resources.CPUUsage,
+			"memoryUsage": wm.worker.Resources.MemoryUsage,
+			"loadUsage":   wm.worker.Resources.LoadUsage,
+			"taskCount":   wm.GetTaskCount(),
+		},
+	}
+	data, err := json.Marshal(workerData)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal worker data: %v", err)
+	}
+
+	_, err = wm.etcd.Put(context.Background(), workerKey, string(data))
+	if err != nil {
+		return fmt.Errorf("failed to put worker data to etcd: %v", err)
 	}
 
 	level.Info(log.Logger).Log("msg", "Worker registered successfully", "id", wm.worker.ID)
 
-	// 启动任务计数同步和心跳
-	go wm.syncTaskCount(ctx)
-	go wm.heartbeat(ctx)
+	go wm.updateWorkerStatus(ctx)
 
 	return nil
 }
 
-func (wm *WorkerManager) heartbeat(ctx context.Context) {
+func (wm *WorkerManager) updateWorkerStatus(ctx context.Context) {
+	level.Info(log.Logger).Log("msg", "Worker status update routine started")
 	workerKey := fmt.Sprintf("/workers/%s", wm.worker.ID)
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -143,18 +170,33 @@ func (wm *WorkerManager) heartbeat(ctx context.Context) {
 			}
 			return
 		case <-ticker.C:
-			workerData := map[string]interface{}{
-				"id":        wm.worker.ID,
-				"hostname":  wm.worker.Hostname,
-				"ip":        wm.worker.IP,
-				"port":      wm.worker.Port,
-				"status":    wm.worker.Status,
-				"lastBeat":  time.Now(),
-				"taskCount": wm.GetTaskCount(),
+			if err := wm.updateResourceInfo(); err != nil {
+				level.Error(log.Logger).Log("msg", "Failed to update resource info", "error", err)
+				continue
 			}
-			data, _ := json.Marshal(workerData)
 
-			_, err := wm.etcd.Put(context.Background(), workerKey, string(data))
+			workerData := map[string]interface{}{
+				"id":       wm.worker.ID,
+				"hostname": wm.worker.Hostname,
+				"ip":       wm.worker.IP,
+				"port":     wm.worker.Port,
+				"status":   wm.worker.Status,
+				"lastBeat": time.Now(),
+				"resources": map[string]interface{}{
+					"cpuUsage":    wm.worker.Resources.CPUUsage,
+					"memoryUsage": wm.worker.Resources.MemoryUsage,
+					"loadUsage":   wm.worker.Resources.LoadUsage,
+					"taskCount":   wm.GetTaskCount(),
+				},
+			}
+
+			data, err := json.Marshal(workerData)
+			if err != nil {
+				level.Error(log.Logger).Log("msg", "Failed to marshal worker data", "error", err)
+				continue
+			}
+
+			_, err = wm.etcd.Put(context.Background(), workerKey, string(data))
 			if err != nil {
 				level.Error(log.Logger).Log("msg", "Failed to update worker info", "error", err, "id", wm.worker.ID)
 			}
@@ -180,51 +222,59 @@ func (wm *WorkerManager) GetTaskCount() int64 {
 	return wm.taskCount
 }
 
-func (wm *WorkerManager) syncTaskCount(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			count := wm.GetTaskCount()
-			workerData := map[string]interface{}{
-				"id":        wm.worker.ID,
-				"hostname":  wm.worker.Hostname,
-				"ip":        wm.worker.IP,
-				"taskCount": count,
-				"lastBeat":  time.Now(),
-			}
-			data, _ := json.Marshal(workerData)
-
-			key := fmt.Sprintf("/workers/%s", wm.worker.ID)
-			_, err := wm.etcd.Put(context.Background(), key, string(data))
-			if err != nil {
-				level.Error(log.Logger).Log("msg", "Failed to sync task count", "error", err)
-			}
-		}
+func (wm *WorkerManager) updateResourceInfo() error {
+	cpuUsage, err := utils.GetCPUUsage()
+	if err != nil {
+		return fmt.Errorf("get CPU usage error: %v", err)
 	}
+
+	memUsage, err := utils.GetMemoryUsage()
+	if err != nil {
+		return fmt.Errorf("get memory usage error: %v", err)
+	}
+
+	loadUsage, err := utils.GetLoadAverage()
+	if err != nil {
+		return fmt.Errorf("get load average error: %v", err)
+	}
+
+	var taskDao = &dao.Task{}
+	taskCount, err := taskDao.WithContext(context.Background()).GetTargetNodeTaskCount(wm.worker.Hostname)
+	if err != nil {
+		return fmt.Errorf("get task count error: %v", err)
+	}
+
+	wm.mu.Lock()
+	wm.worker.Resources.CPUUsage = cpuUsage
+	wm.worker.Resources.MemoryUsage = memUsage
+	wm.worker.Resources.LoadUsage = loadUsage
+	wm.worker.Resources.TaskCount = int(taskCount)
+	wm.mu.Unlock()
+
+	return nil
 }
 
-func GetWorkerTaskCounts(cli *clientv3.Client) (map[string]int64, error) {
-	resp, err := cli.Get(context.Background(), "/workers/", clientv3.WithPrefix())
+func (wm *WorkerManager) getWorkBase() (map[string]ResourceInfo, error) {
+	resp, err := wm.etcd.Get(context.Background(), "/workers/", clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
-
-	counts := make(map[string]int64)
+	resources := make(map[string]ResourceInfo)
 	for _, kv := range resp.Kvs {
 		var workerData map[string]interface{}
 		if err := json.Unmarshal(kv.Value, &workerData); err != nil {
 			continue
 		}
 
-		if count, ok := workerData["taskCount"].(float64); ok {
-			hostname := workerData["hostname"].(string)
-			counts[hostname] = int64(count)
+		hostname := workerData["hostname"].(string)
+		if resourceData, ok := workerData["resources"].(map[string]interface{}); ok {
+			resources[hostname] = ResourceInfo{
+				CPUUsage:    resourceData["cpuUsage"].(float64),
+				MemoryUsage: resourceData["memoryUsage"].(float64),
+				LoadUsage:   resourceData["loadUsage"].(float64),
+				TaskCount:   int(resourceData["taskCount"].(int)),
+			}
 		}
 	}
-	return counts, nil
+	return resources, nil
 }

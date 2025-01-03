@@ -11,9 +11,9 @@ import (
 )
 
 func CheckClientTask(ctx context.Context) {
-	timerTicker, ok := core.CoreConfig["scheduleTimeTicker"].(int64)
+	timerTicker, ok := core.CoreConfig["scheduletimeticker"].(int64)
 	if ok && timerTicker > 0 {
-		timerTicker = core.CoreConfig["scheduleTimeTicker"].(int64)
+		timerTicker = core.CoreConfig["scheduletimeticker"].(int64)
 	} else {
 		timerTicker = 20
 	}

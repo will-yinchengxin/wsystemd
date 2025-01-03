@@ -119,3 +119,13 @@ func (t *Task) GetNodeTaskCount() (map[string]int64, error) {
 
 	return stats, nil
 }
+
+func (t *Task) GetTargetNodeTaskCount(node string) (int64, error) {
+	var count int64
+	err := t.DB.Model(&entity.Task{}).
+		Where("node = ?", node).
+		Where("do_once = ?", consts.NotDoOnce).
+		Count(&count).Error
+
+	return count, err
+}

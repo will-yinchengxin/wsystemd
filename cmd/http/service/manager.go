@@ -18,7 +18,6 @@ import (
 	"wsystemd/cmd/utils"
 
 	"github.com/go-kit/kit/log/level"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 var (
@@ -36,28 +35,25 @@ func CreateClusterModeJob(req params.JobCfg) (interface{}, *utils.CodeType) {
 		return nil, utils.ServerErr
 	}
 
-	// 使用 etcd 获取节点负载
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{cluster.GetEtcdAddr()},
-		DialTimeout: 5 * time.Second,
-	})
+	targetNode, err := cluster.GetWorkNode()
 	if err != nil {
-		return nil, utils.ServerErr
-	}
-	defer cli.Close()
-
-	nodeStats, err := cluster.GetWorkerTaskCounts(cli)
-	if err != nil {
-		// 如果获取失败，回退到数据库查询
+		// 如果获取失败，回退到数据库查询, 按照 task 进行调度
 		var taskDao = &dao.Task{}
-		nodeStats, err = taskDao.WithContext(context.Background()).GetNodeTaskCount()
+		nodeStats, err := taskDao.WithContext(context.Background()).GetNodeTaskCount()
 		if err != nil {
 			level.Error(log.Logger).Log("GetNodeTaskCount Err", err.Error())
 			return nil, utils.DBErr
 		}
+		if len(nodeStats) != 0 {
+			minTasks := 0
+			for node, count := range nodeStats {
+				if int(count) < minTasks {
+					minTasks = int(count)
+					targetNode = node
+				}
+			}
+		}
 	}
-
-	targetNode := cluster.FindLeastLoadedNode(nodeStats)
 
 	if targetNode == localNode {
 		return createJobLocal(req)

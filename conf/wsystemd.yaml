@@ -20,3 +20,5 @@ wsystemd:
   #  - 127.0.0.1
   #  - 127.0.0.1
   workerId: "98005ba6-1c67-4ed2-bd04-25c64b0ee348"
+  # 调度策略: taskCount/cpuUsage/memUsage/loadUsage
+  schedule: cpuUsage

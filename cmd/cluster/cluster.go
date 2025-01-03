@@ -53,17 +53,3 @@ func ForwardToWorker(worker *Worker, path string, body interface{}) (interface{}
 	targetURL := fmt.Sprintf("http://%s:%s%s", worker.IP, worker.Port, path)
 	return utils.ForwardRequest(targetURL, body)
 }
-
-func FindLeastLoadedNode(nodeStats map[string]int64) string {
-	var targetNode string
-	minTasks := int64(^uint64(0) >> 1)
-
-	for node, count := range nodeStats {
-		if count < minTasks {
-			minTasks = count
-			targetNode = node
-		}
-	}
-
-	return targetNode
-}

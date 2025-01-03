@@ -29,7 +29,6 @@ func init() {
 func Run() int {
 	var (
 		serverPort = kingpin.Flag("server-port", "The vsw server port").Short('p').Default(consts.ServerPort).String()
-		srvc       = make(chan struct{})
 		term       = make(chan os.Signal, 1)
 		signals    = []os.Signal{syscall.SIGKILL, syscall.SIGSTOP,
 			syscall.SIGINT, syscall.SIGQUIT, syscall.SIGILL,
@@ -44,12 +43,9 @@ func Run() int {
 	level.Info(log.Logger).Log("msg", "NewProcManager Success")
 
 	srv, cleanFun, err := srv.SetupRouter()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer func() {
-		cancel()
-		CleanFunc(cleanFun)
-		close(term)
-	}()
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	defer shutdownCancel()
+	gracefulShutdown := make(chan struct{})
 	if err != nil {
 		level.Error(log.Logger).Log("msg", "Init Server Fail", "err", err)
 		return 1
@@ -67,7 +63,7 @@ func Run() int {
 			return 1
 		}
 
-		if err := manager.Register(ctx); err != nil {
+		if err := manager.Register(shutdownCtx); err != nil {
 			level.Error(log.Logger).Log("msg", "Failed to register worker", "err", err)
 			return 1
 		}
@@ -77,54 +73,52 @@ func Run() int {
 		level.Info(log.Logger).Log("msg", "Start HTTP Server Success!!! ", "port", *serverPort)
 		if err := http.ListenAndServe(":"+*serverPort, srv); err != nil {
 			level.Error(log.Logger).Log("msg", "Error starting HTTP server", "err", err)
-			close(srvc)
+			time.Sleep(time.Second * 2)
+			shutdownCancel()
 		}
 	}()
 
 	go func() {
-		task.CheckClientTask(ctx)
+		task.CheckClientTask(shutdownCtx)
 	}()
 
 	go func() {
 		<-term
 		level.Info(log.Logger).Log("msg", "Received shutdown signal, starting graceful shutdown...")
 
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		done := make(chan struct{})
-		go func() {
-			cancel()
-			CleanFunc(cleanFun)
-			close(done)
-		}()
+		shutdownCancel()
+		CleanFunc(cleanFun)
 
 		select {
-		case <-done:
-			level.Info(log.Logger).Log("msg", "Graceful shutdown completed")
-		case <-shutdownCtx.Done():
+		case <-timeoutCtx.Done():
 			level.Error(log.Logger).Log("msg", "Graceful shutdown timed out")
+		default:
 		}
 
-		os.Exit(0)
+		close(gracefulShutdown)
 	}()
 
-	for {
-		select {
-		case <-term:
-			level.Info(log.Logger).Log("msg", "Received SIGTERM, Exiting Gracefully...")
-			return 0
-		case <-srvc:
-			level.Error(log.Logger).Log("msg", "Server Exist With Error, Check it...")
-			return 1
-		}
+	select {
+	case <-shutdownCtx.Done():
+		level.Info(log.Logger).Log("msg", "Server shutdown initiated")
+		<-gracefulShutdown
+		level.Info(log.Logger).Log("msg", "Graceful shutdown completed")
+		return 0
 	}
 }
 
 func CleanFunc(cleanFun []func()) {
-	if len(cleanFun) > 0 {
-		for _, clearFunc := range cleanFun {
+	for _, clearFunc := range cleanFun {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					level.Error(log.Logger).Log("msg", "Panic in cleanup function", "error", r)
+				}
+			}()
 			clearFunc()
-		}
+		}()
 	}
 }
